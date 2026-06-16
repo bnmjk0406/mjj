@@ -1,92 +1,46 @@
 // =====================================================================
-// 【ESP32 + L298N 五路黑線自走車】最終統整版
-// 適用：48 mm 黑線、L298N、一顆按鈕起跑/急停、ASL 指示燈
+// 【ESP32 + L298N 五路黑線自走車】防晃＋加強轉彎版 v3
+// 修正：上一版變得不太會轉彎
 //
-// 功能：
-// 1. 按鈕 VLS：按一下起跑，倒數後進入自主導航
-// 2. 按鈕 EBS：行駛中再按一下，立即停止
-// 3. ASL：
-//    綠燈 = 安全狀態 / 停止
-//    紅燈 = 自主導航 / 車子正在跑
-//    藍燈 = 倒數或其他狀態
-// 4. 強化 48 mm 寬黑線轉彎能力
-// 5. 直角彎會鎖定轉彎一小段時間，避免太早放掉
-//
-// 接線前提：
-// 1. ESP32
-// 2. L298N ENA、ENB 跳帽插上
-// 3. OUT1/OUT2 接左側兩顆馬達
-// 4. OUT3/OUT4 接右側兩顆馬達
-// 5. 感測器黑線 = 1，白色 = 0
+// 目標：
+// 1. 直線不要瘋狂左右晃
+// 2. L2 / R2 外側感測器一偵測到黑線，就進入鎖定轉彎
+// 3. 轉彎不是原地轉，而是內輪慢速前進、外輪大力前進
+// 4. 轉到中間 M 重新偵測到黑線後離開轉彎
 // =====================================================================
 
 #include <Arduino.h>
 
-// =====================================================================
-// 1. 按鈕與 ASL 指示燈
-// =====================================================================
+// ---------------- 啟動按鈕與 RGB LED ----------------
+const int VLS_PIN = 4;
 
-const int VLS_PIN = 4;   // 起跑/急停按鈕，按鈕另一端接 GND
-
-const int LED_R = 2;
+const int LED_R = 5;
 const int LED_G = 15;
-const int LED_B = 5;
+const int LED_B = 2;
 
-// 如果你們 RGB LED 是「高電位亮」，維持 true
-// 如果燈號顏色怪怪的，改成 false
-const bool LED_ACTIVE_HIGH = true;
-
-const int LED_ON  = LED_ACTIVE_HIGH ? HIGH : LOW;
-const int LED_OFF = LED_ACTIVE_HIGH ? LOW  : HIGH;
-
-// =====================================================================
-// 2. 五路循跡感測器腳位
-// 左到右：L2、L1、M、R1、R2
-// =====================================================================
-
+// ---------------- 五路感測器腳位：左到右 ----------------
 const int S_L2 = 25;
 const int S_L1 = 26;
 const int S_M  = 27;
 const int S_R1 = 14;
 const int S_R2 = 12;
 
-// 你們目前設定：黑線 = 1，白色 = 0
-// 如果實測相反，改成 BLACK = 0, WHITE = 1
+// 黑線 = 1，白底 = 0
 const int BLACK = 1;
 const int WHITE = 0;
 
-// 如果感測器左右裝反，改成 true
-const bool SWAP_SENSOR_SIDE = false;
+// ---------------- L298N 馬達控制腳位 ----------------
+// 這組是你們目前確認可正常直走、左右判斷正確的腳位
+const int M_L1 = 19;
+const int M_L2 = 18;
 
-// =====================================================================
-// 3. L298N 馬達腳位
-// 這組是前面依照你們車子狀況修正後的版本
-// 若 M 黑線時四輪會往前，就不要改這四行
-// =====================================================================
+const int M_R1 = 17;
+const int M_R2 = 16;
 
-const int M_L1 = 19;   // 左側馬達方向 1
-const int M_L2 = 18;   // 左側馬達方向 2
+bool INVERT_LEFT  = false;
+bool INVERT_RIGHT = false;
 
-const int M_R1 = 17;   // 右側馬達方向 1
-const int M_R2 = 16;   // 右側馬達方向 2
-
-// 如果直走正確，但左轉右轉相反，改成 true
-const bool SWAP_TURN_DIRECTION = false;
-
-// 如果左側整組前後反了，改成 true
-const bool INVERT_LEFT = false;
-
-// 如果右側整組前後反了，改成 true
-const bool INVERT_RIGHT = false;
-
-// 如果左右馬達通道整組反了，改成 true
-const bool SWAP_MOTOR_SIDE = false;
-
-// =====================================================================
-// 4. PWM 設定
-// L298N 的 ENA/ENB 跳帽插著時，可以用 IN 腳 PWM 控速
-// =====================================================================
-
+// ---------------- PWM 設定 ----------------
 const int PWM_FREQ = 20000;
 const int PWM_BITS = 8;
 const int PWM_MAX  = 255;
@@ -97,54 +51,104 @@ const int CH_R1 = 2;
 const int CH_R2 = 3;
 
 // =====================================================================
-// 5. 速度參數
-// 如果轉彎轉不動，優先調 SHARP_FAST、SHARP_SLOW、MIN_TURN_TIME
+// 速度設定
 // =====================================================================
 
-// 一般速度
-int BASE_SPEED = 185;
+// 直線速度
+int BASE_SPEED     = 140;
+int STRAIGHT_SPEED = 150;
 
-// 中線穩定時直線速度
-int FAST_SPEED = 205;
+// 偏差大時降速
+int CORNER_SPEED = 120;
 
-// 小彎速度
-int MINOR_FAST = 200;
-int MINOR_SLOW = 75;
+// 最大速度
+int MAX_SPEED = 185;
 
-// 直角彎速度
-// 外側輪全速前進，內側輪全速後退
-int SHARP_FAST = 255;
-int SHARP_SLOW = -255;
+// L298N 低 PWM 容易推不動
+int MIN_PWM = 90;
 
-// 掉線找線速度
-int LOST_SPEED = 150;
+// PD 修正最大值：越小越不晃，但太小會轉不動
+int MAX_CORRECTION = 55;
 
-// 直角彎最短鎖定時間
-// 轉不動：130 改 160 或 180
-// 轉過頭：130 改 100 或 90
-const unsigned long MIN_TURN_TIME = 150;
+// ---------------- 轉彎速度 ----------------
+// 不原地轉：內輪慢速前進、外輪大力前進
+int TURN_OUTER_SPEED = 215;
+int TURN_INNER_SPEED = 75;
 
-// 直角彎最長鎖定時間
-const unsigned long MAX_TURN_TIME = 550;
+// 掉線找線
+int RECOVER_OUTER_SPEED = 165;
+int RECOVER_INNER_SPEED = 85;
 
-// 按鈕防彈跳時間
-const unsigned long BUTTON_DEBOUNCE = 350;
+// ---------------- 轉彎控制 ----------------
+// 轉彎至少持續時間，避免剛進彎就誤判 M 黑線
+const int TURN_MIN_TIME = 170;
 
-// =====================================================================
-// 6. 狀態變數
-// =====================================================================
+// 若 M 一直沒有重新看到黑線，最多轉這麼久
+const int TURN_MAX_TIME = 1400;
 
+// 出彎後冷卻時間：縮短，避免下一個彎抓不到
+const int TURN_COOLDOWN_TIME = 160;
+
+// 出彎後往前推一小段
+const int AFTER_TURN_FORWARD_TIME = 70;
+
+// 全白時先維持上一拍
+const int LOST_HOLD_TIME = 60;
+
+// ---------------- PD 參數 ----------------
+// 不用 Ki，避免累積誤差造成後段越晃越大
+float Kp = 0.030;
+float Kd = 0.080;
+
+// 誤差死區：小偏差不修正，減少蛇行
+const int ERROR_DEADBAND = 250;
+
+// ---------------- 狀態記錄 ----------------
 bool isRunning = false;
+bool DEBUG_PRINT = false;
 
-int lastDirection = 0;    // -1 = 左，1 = 右，0 = 中間
-int turnMode = 0;         // -1 = 左急轉，1 = 右急轉，0 = 無
+int weight[5] = {-2000, -1000, 0, 1000, 2000};
 
-unsigned long turnStartTime = 0;
-unsigned long lastButtonTime = 0;
+int lastError = 0;
+float filteredError = 0;
+
+int lastDirection = 0;
+// -1 = 最後線在左邊
+//  1 = 最後線在右邊
+//  0 = 中間
+
+int lastLeftPWM = 0;
+int lastRightPWM = 0;
+
+unsigned long lastSeenTime = 0;
 unsigned long lastPrintTime = 0;
+unsigned long turnCooldownUntil = 0;
 
 // =====================================================================
-// 7. ESP32 PWM 相容處理
+// 函式宣告
+// =====================================================================
+
+void setupPWMOne(int pin, int channel);
+void writePWMOne(int pin, int channel, int duty);
+
+int stableReadPin(int pin);
+void readSensors(int s[5]);
+int getLinePosition(int s[5], int &activeCount);
+
+void followLine();
+void lockedTurnLeft();
+void lockedTurnRight();
+void recoverLine();
+
+void setMotor(int left, int right);
+int applyMinPWM(int pwm);
+
+void setASL(int r, int g, int b);
+void countdownStart();
+void printSensor(int s[5], const char* action, int leftPWM, int rightPWM);
+
+// =====================================================================
+// ESP32 PWM 相容處理
 // =====================================================================
 
 void setupPWMOne(int pin, int channel) {
@@ -167,7 +171,7 @@ void writePWMOne(int pin, int channel, int duty) {
 }
 
 // =====================================================================
-// 8. 初始化
+// setup
 // =====================================================================
 
 void setup() {
@@ -192,319 +196,326 @@ void setup() {
 
   setMotor(0, 0);
 
-  // 開機待命：安全狀態，綠燈
-  setASL_GREEN();
+  setASL(LOW, HIGH, LOW);
 
-  Serial.println("========================================");
-  Serial.println("ESP32 + L298N 五路黑線車 最終統整版");
-  Serial.println("按一下按鈕：起跑");
-  Serial.println("行駛中再按一下：急停");
-  Serial.println("綠燈：安全狀態");
-  Serial.println("紅燈：自主導航狀態");
-  Serial.println("藍燈：倒數 / 其他狀態");
-  Serial.println("========================================");
+  Serial.println("ESP32 + L298N 五路黑線車：防晃＋加強轉彎版 v3");
 }
 
 // =====================================================================
-// 9. 主迴圈
+// loop
 // =====================================================================
 
 void loop() {
-  handleButton();
-
   if (!isRunning) {
-    setMotor(0, 0);
-    setASL_GREEN();   // 停止時保持綠燈
+    if (digitalRead(VLS_PIN) == LOW) {
+      delay(50);
+
+      if (digitalRead(VLS_PIN) == LOW) {
+        countdownStart();
+
+        lastError = 0;
+        filteredError = 0;
+        lastDirection = 0;
+        lastSeenTime = millis();
+        turnCooldownUntil = 0;
+
+        isRunning = true;
+        setASL(HIGH, LOW, LOW);
+      }
+    }
+
     return;
   }
 
-  setASL_RED();       // 車子跑的時候保持紅燈
   followLine();
 }
 
 // =====================================================================
-// 10. 按鈕控制：按一下起跑，再按一下急停
-// =====================================================================
-
-void handleButton() {
-  if (digitalRead(VLS_PIN) == LOW && millis() - lastButtonTime > BUTTON_DEBOUNCE) {
-    lastButtonTime = millis();
-
-    if (!isRunning) {
-      Serial.println(">>> VLS 觸發：準備起跑 <<<");
-
-      setMotor(0, 0);
-      turnMode = 0;
-      lastDirection = 0;
-
-      // 倒數期間：藍燈
-      Serial.println("3");
-      blinkBlue();
-
-      Serial.println("2");
-      blinkBlue();
-
-      Serial.println("1");
-      blinkBlue();
-
-      Serial.println("GO!");
-
-      isRunning = true;
-      setASL_RED();   // 自主導航：紅燈
-    }
-    else {
-      Serial.println("!!! EBS 急停：進入安全狀態 !!!");
-
-      isRunning = false;
-      turnMode = 0;
-
-      setMotor(0, 0);
-      setASL_GREEN(); // 安全狀態：綠燈
-    }
-  }
-}
-
-void blinkBlue() {
-  setASL_BLUE();
-  delay(300);
-
-  setASL_OFF();
-  delay(300);
-}
-
-// =====================================================================
-// 11. 尋線主邏輯
+// 主循跡邏輯
 // =====================================================================
 
 void followLine() {
-  int l2 = digitalRead(S_L2);
-  int l1 = digitalRead(S_L1);
-  int m  = digitalRead(S_M);
-  int r1 = digitalRead(S_R1);
-  int r2 = digitalRead(S_R2);
-
-  // 若感測器左右裝反，可用 SWAP_SENSOR_SIDE 一鍵交換
-  if (SWAP_SENSOR_SIDE) {
-    int temp;
-
-    temp = l2;
-    l2 = r2;
-    r2 = temp;
-
-    temp = l1;
-    l1 = r1;
-    r1 = temp;
-  }
-
-  bool L2 = (l2 == BLACK);
-  bool L1 = (l1 == BLACK);
-  bool M  = (m  == BLACK);
-  bool R1 = (r1 == BLACK);
-  bool R2 = (r2 == BLACK);
+  int s[5];
+  readSensors(s);
 
   int activeCount = 0;
-  if (L2) activeCount++;
-  if (L1) activeCount++;
-  if (M)  activeCount++;
-  if (R1) activeCount++;
-  if (R2) activeCount++;
+  int error = getLinePosition(s, activeCount);
 
-  // ---------------------------------------------------------
-  // A. 直角彎鎖定模式
-  // 進入直角彎後，不要太早因為看到中間線就放掉
-  // ---------------------------------------------------------
-  if (turnMode != 0) {
-    unsigned long t = millis() - turnStartTime;
-
-    if (turnMode == -1) {
-      hardLeft();
-    }
-    else if (turnMode == 1) {
-      hardRight();
-    }
-
-    // 至少轉 MIN_TURN_TIME 後，才允許解除
-    if (t > MIN_TURN_TIME) {
-      if (M || activeCount >= 3 || t > MAX_TURN_TIME) {
-        turnMode = 0;
-      }
-    }
-
-    printSensor(l2, l1, m, r1, r2, "LOCK_TURN");
-    return;
-  }
-
-  // ---------------------------------------------------------
-  // B. 全白：掉線
-  // 根據最後一次方向找線
-  // ---------------------------------------------------------
   if (activeCount == 0) {
-    if (lastDirection < 0) {
-      hardLeft();
-      printSensor(l2, l1, m, r1, r2, "LOST_LEFT");
-    }
-    else if (lastDirection > 0) {
-      hardRight();
-      printSensor(l2, l1, m, r1, r2, "LOST_RIGHT");
-    }
-    else {
-      setMotor(120, 120);
-      printSensor(l2, l1, m, r1, r2, "LOST_FORWARD");
-    }
-
+    recoverLine();
     return;
   }
 
+  lastSeenTime = millis();
+
+  bool inCooldown = millis() < turnCooldownUntil;
+
+  int l2 = s[0];
+  int l1 = s[1];
+  int m  = s[2];
+  int r1 = s[3];
+  int r2 = s[4];
+
   // ---------------------------------------------------------
-  // C. 最外側感測器優先：直角彎
-  // 48 mm 黑線很寬，所以外側感測器要最高優先權
+  // 1. 加強轉彎觸發
+  // 外側 L2 / R2 優先判斷，避免上一版太保守導致不轉彎
   // ---------------------------------------------------------
-  if (L2 && !R2) {
-    turnMode = -1;
-    turnStartTime = millis();
+
+  bool leftTurnCandidate =
+    !inCooldown &&
+    (
+      // 左外側碰到黑線，通常就是左彎入口
+      (l2 == BLACK && r2 == WHITE) ||
+
+      // 左側 L1 明顯黑、右側都白，也視為左彎
+      (l1 == BLACK && m == WHITE && r1 == WHITE && r2 == WHITE) ||
+
+      // L2 + L1 同時黑，也視為左彎
+      (l2 == BLACK && l1 == BLACK)
+    );
+
+  bool rightTurnCandidate =
+    !inCooldown &&
+    (
+      // 右外側碰到黑線，通常就是右彎入口
+      (r2 == BLACK && l2 == WHITE) ||
+
+      // 右側 R1 明顯黑、左側都白，也視為右彎
+      (r1 == BLACK && m == WHITE && l1 == WHITE && l2 == WHITE) ||
+
+      // R2 + R1 同時黑，也視為右彎
+      (r2 == BLACK && r1 == BLACK)
+    );
+
+  // 左右同時觸發時，不進入強轉，避免寬黑線或交會點誤判
+  if (leftTurnCandidate && !rightTurnCandidate) {
     lastDirection = -1;
-
-    hardLeft();
-    printSensor(l2, l1, m, r1, r2, "HARD_LEFT");
+    printSensor(s, "鎖定左轉", 0, 0);
+    lockedTurnLeft();
     return;
   }
 
-  if (R2 && !L2) {
-    turnMode = 1;
-    turnStartTime = millis();
+  if (rightTurnCandidate && !leftTurnCandidate) {
     lastDirection = 1;
-
-    hardRight();
-    printSensor(l2, l1, m, r1, r2, "HARD_RIGHT");
+    printSensor(s, "鎖定右轉", 0, 0);
+    lockedTurnRight();
     return;
   }
 
   // ---------------------------------------------------------
-  // D. 左側偏移：左轉修正
+  // 2. PD 線循跡
   // ---------------------------------------------------------
-  if ((L1 || L2) && !R1 && !R2) {
+
+  // 低通濾波，避免誤差瞬間跳太大
+  filteredError = filteredError * 0.65 + error * 0.35;
+
+  int useError = (int)filteredError;
+
+  // deadband：接近中間就不修正，減少左右晃
+  if (abs(useError) < ERROR_DEADBAND) {
+    useError = 0;
+  }
+
+  int derivative = useError - lastError;
+
+  int correction = (int)(Kp * useError + Kd * derivative);
+  correction = constrain(correction, -MAX_CORRECTION, MAX_CORRECTION);
+
+  int base = BASE_SPEED;
+
+  // 線很置中才加速
+  if (useError == 0 && m == BLACK) {
+    base = STRAIGHT_SPEED;
+  }
+
+  // 偏差大就降速
+  if (abs(useError) > 1000) {
+    base = CORNER_SPEED;
+  }
+
+  int leftPWM  = base + correction;
+  int rightPWM = base - correction;
+
+  leftPWM  = constrain(leftPWM,  MIN_PWM, MAX_SPEED);
+  rightPWM = constrain(rightPWM, MIN_PWM, MAX_SPEED);
+
+  setMotor(leftPWM, rightPWM);
+
+  if (useError < 0) {
     lastDirection = -1;
-
-    softLeft();
-    printSensor(l2, l1, m, r1, r2, "SOFT_LEFT");
-    return;
   }
-
-  // ---------------------------------------------------------
-  // E. 右側偏移：右轉修正
-  // ---------------------------------------------------------
-  if ((R1 || R2) && !L1 && !L2) {
+  else if (useError > 0) {
     lastDirection = 1;
-
-    softRight();
-    printSensor(l2, l1, m, r1, r2, "SOFT_RIGHT");
-    return;
   }
-
-  // ---------------------------------------------------------
-  // F. 中間黑線：直走
-  // ---------------------------------------------------------
-  if (M) {
+  else {
     lastDirection = 0;
+  }
 
-    if (activeCount >= 3) {
-      // 寬線或交會處，不要太暴衝
-      setMotor(BASE_SPEED, BASE_SPEED);
-      printSensor(l2, l1, m, r1, r2, "WIDE_FORWARD");
-    }
-    else {
-      setMotor(FAST_SPEED, FAST_SPEED);
-      printSensor(l2, l1, m, r1, r2, "FAST_FORWARD");
+  lastError = useError;
+
+  printSensor(s, "PD循線", leftPWM, rightPWM);
+}
+
+// =====================================================================
+// 左轉鎖定：左內輪慢、右外輪快，直到 M 重新看到黑線
+// =====================================================================
+
+void lockedTurnLeft() {
+  unsigned long startTime = millis();
+  bool centerWasWhite = false;
+
+  while (millis() - startTime < TURN_MAX_TIME) {
+    int s[5];
+    readSensors(s);
+
+    // 左轉：左側慢速前進，右側快速前進
+    setMotor(TURN_INNER_SPEED, TURN_OUTER_SPEED);
+
+    unsigned long elapsed = millis() - startTime;
+
+    if (elapsed > 50 && s[2] == WHITE) {
+      centerWasWhite = true;
     }
 
+    // 避免一開始 M 還在舊線上就退出
+    if (elapsed > TURN_MIN_TIME && s[2] == BLACK && (centerWasWhite || elapsed > 360)) {
+      break;
+    }
+
+    delay(5);
+  }
+
+  setMotor(0, 0);
+  delay(20);
+
+  setMotor(BASE_SPEED, BASE_SPEED);
+  delay(AFTER_TURN_FORWARD_TIME);
+
+  lastError = 0;
+  filteredError = 0;
+  lastDirection = 0;
+
+  turnCooldownUntil = millis() + TURN_COOLDOWN_TIME;
+}
+
+// =====================================================================
+// 右轉鎖定：左外輪快、右內輪慢，直到 M 重新看到黑線
+// =====================================================================
+
+void lockedTurnRight() {
+  unsigned long startTime = millis();
+  bool centerWasWhite = false;
+
+  while (millis() - startTime < TURN_MAX_TIME) {
+    int s[5];
+    readSensors(s);
+
+    // 右轉：左側快速前進，右側慢速前進
+    setMotor(TURN_OUTER_SPEED, TURN_INNER_SPEED);
+
+    unsigned long elapsed = millis() - startTime;
+
+    if (elapsed > 50 && s[2] == WHITE) {
+      centerWasWhite = true;
+    }
+
+    // 避免一開始 M 還在舊線上就退出
+    if (elapsed > TURN_MIN_TIME && s[2] == BLACK && (centerWasWhite || elapsed > 360)) {
+      break;
+    }
+
+    delay(5);
+  }
+
+  setMotor(0, 0);
+  delay(20);
+
+  setMotor(BASE_SPEED, BASE_SPEED);
+  delay(AFTER_TURN_FORWARD_TIME);
+
+  lastError = 0;
+  filteredError = 0;
+  lastDirection = 0;
+
+  turnCooldownUntil = millis() + TURN_COOLDOWN_TIME;
+}
+
+// =====================================================================
+// 掉線找線
+// =====================================================================
+
+void recoverLine() {
+  unsigned long lostTime = millis() - lastSeenTime;
+
+  if (lostTime < LOST_HOLD_TIME) {
+    setMotor(lastLeftPWM, lastRightPWM);
     return;
   }
 
-  // ---------------------------------------------------------
-  // G. 左右都有黑，可能是寬線或膠帶重疊，慢速直走
-  // ---------------------------------------------------------
-  if (activeCount >= 3) {
-    setMotor(BASE_SPEED, BASE_SPEED);
-    printSensor(l2, l1, m, r1, r2, "WIDE_LINE");
-    return;
-  }
-
-  // ---------------------------------------------------------
-  // H. 其他不明狀況：照最後方向修正
-  // ---------------------------------------------------------
   if (lastDirection < 0) {
-    softLeft();
-    printSensor(l2, l1, m, r1, r2, "UNKNOWN_LEFT");
+    setMotor(RECOVER_INNER_SPEED, RECOVER_OUTER_SPEED);
   }
   else if (lastDirection > 0) {
-    softRight();
-    printSensor(l2, l1, m, r1, r2, "UNKNOWN_RIGHT");
+    setMotor(RECOVER_OUTER_SPEED, RECOVER_INNER_SPEED);
   }
   else {
-    setMotor(BASE_SPEED, BASE_SPEED);
-    printSensor(l2, l1, m, r1, r2, "UNKNOWN_FORWARD");
+    setMotor(120, 120);
   }
 }
 
 // =====================================================================
-// 12. 動作函式
+// 感測器讀取：3 次多數決
 // =====================================================================
 
-void softLeft() {
-  if (!SWAP_TURN_DIRECTION) {
-    // 左轉：左側慢，右側快
-    setMotor(MINOR_SLOW, MINOR_FAST);
+int stableReadPin(int pin) {
+  int sum = 0;
+
+  for (int i = 0; i < 3; i++) {
+    sum += digitalRead(pin);
+    delayMicroseconds(250);
   }
-  else {
-    setMotor(MINOR_FAST, MINOR_SLOW);
-  }
+
+  return (sum >= 2) ? 1 : 0;
 }
 
-void softRight() {
-  if (!SWAP_TURN_DIRECTION) {
-    // 右轉：左側快，右側慢
-    setMotor(MINOR_FAST, MINOR_SLOW);
-  }
-  else {
-    setMotor(MINOR_SLOW, MINOR_FAST);
-  }
-}
-
-void hardLeft() {
-  if (!SWAP_TURN_DIRECTION) {
-    // 急左轉：左側後退，右側前進
-    setMotor(SHARP_SLOW, SHARP_FAST);
-  }
-  else {
-    setMotor(SHARP_FAST, SHARP_SLOW);
-  }
-}
-
-void hardRight() {
-  if (!SWAP_TURN_DIRECTION) {
-    // 急右轉：左側前進，右側後退
-    setMotor(SHARP_FAST, SHARP_SLOW);
-  }
-  else {
-    setMotor(SHARP_SLOW, SHARP_FAST);
-  }
+void readSensors(int s[5]) {
+  s[0] = stableReadPin(S_L2);
+  s[1] = stableReadPin(S_L1);
+  s[2] = stableReadPin(S_M);
+  s[3] = stableReadPin(S_R1);
+  s[4] = stableReadPin(S_R2);
 }
 
 // =====================================================================
-// 13. 馬達控制
-// left / right：
-// 正值 = 前進
-// 負值 = 後退
-// 0 = 停止
+// 計算線的位置
+// 回傳：-2000 ~ 2000
+// 負值代表線在左，正值代表線在右
+// =====================================================================
+
+int getLinePosition(int s[5], int &activeCount) {
+  long weightedSum = 0;
+  activeCount = 0;
+
+  for (int i = 0; i < 5; i++) {
+    if (s[i] == BLACK) {
+      activeCount++;
+      weightedSum += weight[i];
+    }
+  }
+
+  if (activeCount == 0) {
+    return lastError;
+  }
+
+  return weightedSum / activeCount;
+}
+
+// =====================================================================
+// 馬達控制
+// left / right：正值前進，負值後退
 // =====================================================================
 
 void setMotor(int left, int right) {
-  if (SWAP_MOTOR_SIDE) {
-    int temp = left;
-    left = right;
-    right = temp;
-  }
-
   if (INVERT_LEFT) {
     left = -left;
   }
@@ -515,6 +526,12 @@ void setMotor(int left, int right) {
 
   left  = constrain(left,  -PWM_MAX, PWM_MAX);
   right = constrain(right, -PWM_MAX, PWM_MAX);
+
+  left  = applyMinPWM(left);
+  right = applyMinPWM(right);
+
+  lastLeftPWM = left;
+  lastRightPWM = right;
 
   // 左側馬達
   if (left > 0) {
@@ -545,52 +562,68 @@ void setMotor(int left, int right) {
   }
 }
 
-// =====================================================================
-// 14. ASL 燈號控制
-// =====================================================================
+int applyMinPWM(int pwm) {
+  if (pwm == 0) {
+    return 0;
+  }
 
-void setASL_RED() {
-  digitalWrite(LED_R, LED_ON);
-  digitalWrite(LED_G, LED_OFF);
-  digitalWrite(LED_B, LED_OFF);
-}
+  if (pwm > 0 && pwm < MIN_PWM) {
+    return MIN_PWM;
+  }
 
-void setASL_GREEN() {
-  digitalWrite(LED_R, LED_OFF);
-  digitalWrite(LED_G, LED_ON);
-  digitalWrite(LED_B, LED_OFF);
-}
+  if (pwm < 0 && pwm > -MIN_PWM) {
+    return -MIN_PWM;
+  }
 
-void setASL_BLUE() {
-  digitalWrite(LED_R, LED_OFF);
-  digitalWrite(LED_G, LED_OFF);
-  digitalWrite(LED_B, LED_ON);
-}
-
-void setASL_OFF() {
-  digitalWrite(LED_R, LED_OFF);
-  digitalWrite(LED_G, LED_OFF);
-  digitalWrite(LED_B, LED_OFF);
+  return pwm;
 }
 
 // =====================================================================
-// 15. Serial 除錯輸出
+// LED 與倒數
 // =====================================================================
 
-void printSensor(int l2, int l1, int m, int r1, int r2, const char* action) {
-  if (millis() - lastPrintTime < 80) {
+void setASL(int r, int g, int b) {
+  digitalWrite(LED_R, r);
+  digitalWrite(LED_G, g);
+  digitalWrite(LED_B, b);
+}
+
+void countdownStart() {
+  for (int i = 0; i < 3; i++) {
+    setASL(LOW, LOW, HIGH);
+    delay(200);
+
+    setASL(LOW, LOW, LOW);
+    delay(200);
+  }
+}
+
+// =====================================================================
+// Serial 輸出
+// =====================================================================
+
+void printSensor(int s[5], const char* action, int leftPWM, int rightPWM) {
+  if (!DEBUG_PRINT) {
     return;
   }
 
-  lastPrintTime = millis();
+  if (millis() - lastPrintTime > 150) {
+    lastPrintTime = millis();
 
-  Serial.print("S=");
-  Serial.print(l2);
-  Serial.print(l1);
-  Serial.print(m);
-  Serial.print(r1);
-  Serial.print(r2);
+    Serial.print("S=");
+    Serial.print(s[0]);
+    Serial.print(s[1]);
+    Serial.print(s[2]);
+    Serial.print(s[3]);
+    Serial.print(s[4]);
 
-  Serial.print("  ACTION=");
-  Serial.println(action);
+    Serial.print(" ");
+    Serial.print(action);
+
+    Serial.print(" L=");
+    Serial.print(leftPWM);
+
+    Serial.print(" R=");
+    Serial.println(rightPWM);
+  }
 }
